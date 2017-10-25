@@ -12,6 +12,14 @@ use self::winapi::*;
 use self::advapi32::*;
 use self::kernel32::*;
 
+//NH - 10/24/2017
+use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+use std::thread::sleep;
+use std::time::Duration;
+
 declare_singleton! (singleton, DaemonHolder, DaemonHolder {holder: 0 as *mut DaemonStatic});
 
 struct DaemonHolder {
@@ -120,6 +128,7 @@ fn guard_compare_and_swap(old_value: *mut DaemonStatic, new_value: *mut DaemonSt
 
 fn daemon_service(daemon: &mut DaemonStatic) -> Result<(), Error>
 {
+	debug!("daemon_service starting");
 	unsafe
 	{
 		let service_name = service_name(&daemon.name);
@@ -132,24 +141,31 @@ fn daemon_service(daemon: &mut DaemonStatic) -> Result<(), Error>
 		];
 		match StartServiceCtrlDispatcherW(*service_table.as_ptr())
 		{
-			0 => daemon_console(daemon),
+			0 => {
+				error!("{}", &Error::last_os_error());
+				daemon_console(daemon)
+			},
 			_ => Ok(())
+
 		}
 	}
 }
 
 fn daemon_console(daemon: &mut DaemonStatic) -> Result<(), Error>
 {
+	debug!("daemon_console starting");
 	let result;
 	unsafe
 	{
 		if SetConsoleCtrlHandler(Some(console_handler), TRUE) == FALSE
 		{
+			error!("{}", &Error::last_os_error());
 			return Err(Error::last_os_error());
 		}
 		result = daemon.holder.exec();
 		if SetConsoleCtrlHandler(Some(console_handler), FALSE) == FALSE
 		{
+			error!("{}", &Error::last_os_error());
 			return Err(Error::last_os_error());
 		}
 	}
@@ -181,14 +197,20 @@ unsafe extern "system" fn service_main(
 	daemon_wrapper(|daemon_static: &mut DaemonHolder| {
 		if daemon_static.holder != daemon_null()
 		{
+			debug!("service_main starting");
 			let daemon = &mut *daemon_static.holder;
 			let service_name = service_name(&daemon.name);
+			debug!("service_main - registering service {}", &daemon.name);
 			daemon.handle = RegisterServiceCtrlHandlerExW(service_name.as_ptr(), Some(service_handler), ptr::null_mut());
+			debug!("service_main - setting status to running");
 			SetServiceStatus (daemon.handle, &mut create_service_status(SERVICE_START_PENDING));
 			SetServiceStatus (daemon.handle, &mut create_service_status(SERVICE_RUNNING));
 
+			debug!("service_main - starting daemon worker function");
 			daemon.holder.exec().unwrap();
-			SetServiceStatus (daemon.handle, &mut create_service_status(SERVICE_STOPPED));
+			debug!("service_main - started daemon worker function");
+
+			//SetServiceStatus (daemon.handle, &mut create_service_status(SERVICE_STOPPED));
 		}
 	});
 }
@@ -199,20 +221,29 @@ unsafe extern "system" fn service_handler(
 	_: LPVOID, // lp_event_data
 	_: LPVOID  // lp_context
 ) -> DWORD {
+
 	daemon_wrapper(|daemon_static: &mut DaemonHolder| {
 		let daemon = &mut *daemon_static.holder;
 		match dw_control {
 			SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+				info!("service_handler - received stop or shutdown signal");
 				match daemon.holder.take_tx()
 				{
 					Some(ref tx) => {
 						SetServiceStatus (daemon.handle, &mut create_service_status(SERVICE_STOP_PENDING));
 						let _ = tx.send(State::Stop);
+
+						//TODO : Blocking channel? This is not really correct
+						sleep(Duration::from_secs(5));
+						info!("service_handler - service stopping");
+						SetServiceStatus (daemon.handle, &mut create_service_status(SERVICE_STOPPED));
 					}
 					None => {}
 				}
 			}
-			_ => {}
+			_ => {
+				//debug!("Unmatched dw_control received: {}", &dw_control);
+			}
 		};
 	});
 	0
